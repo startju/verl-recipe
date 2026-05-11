@@ -78,7 +78,7 @@
 
 ### 单轮 (single-turn)
 ```bash
-bash recipe/partial_rollout/run_qwen3-0.6b_gsm8k_grpo.sh
+bash recipe/partial_rollout/shell/run_qwen3-0.6b_gsm8k_grpo.sh
 ```
 
 ### 多轮工具调用 (tool agent)
@@ -89,7 +89,7 @@ python3 examples/data_preprocess/gsm8k_multiturn_w_tool.py \
 ```
 再启动：
 ```bash
-bash recipe/partial_rollout/run_qwen3-0.6b_gsm8k_grpo_tool.sh
+bash recipe/partial_rollout/shell/run_qwen3-0.6b_gsm8k_grpo_tool.sh
 ```
 
 ### 关键 Hydra override
