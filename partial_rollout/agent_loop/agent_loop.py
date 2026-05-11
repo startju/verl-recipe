@@ -53,32 +53,68 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         self.prompt_manager_handle = prompt_manager_handle
 
     async def run_continuous(self, max_inflight_prompts: int) -> None:
-        """Persistent worker loop fed by the prompt manager's blocking
-        `pull_prompts` (await on an asyncio.Event — no sleep/poll). The
-        abort/resume cycle around `update_weights` is owned by the upstream
-        `checkpoint_engine` (bracketing the weight transfer), and any
-        aborted `client.generate(...)` calls are retried with accumulated
-        context inside `FullyLLMServerClient.generate()`. Loop ends when the
-        actor is destroyed at training end.
+        """Persistent worker loop. Pulls and rollouts share a single
+        `asyncio.wait`: one pull RPC is kept in flight as a Task whenever
+        there is spare capacity (`len(running) < max_inflight_prompts`). That
+        way completed rollouts get pushed back to the prompt manager without
+        waiting for the next pull to return, and under-fill pulls (when
+        `pending_queue` had fewer prompts than asked) immediately re-issue.
+
+        Aborted `client.generate(...)` calls are retried with accumulated
+        context inside `FullyLLMServerClient.generate()`, so the worker is
+        oblivious to the cancel/resume cycle the manager wires around
+        `update_weights`.
+
+        Exit: an empty list from `pull_prompts` is the shutdown signal — the
+        prompt manager returns `[]` only when it has been stopped (see
+        `RolloutPromptManager.stop`). We then stop issuing new pulls, drain
+        the rollouts already in flight (pushing each back), and return.
         """
         running: set[asyncio.Task] = set()
         pull = self.prompt_manager_handle.pull_prompts.remote
         push = self.prompt_manager_handle.push_prompts.remote
 
-        # Bootstrap: blocks until the trainer's first push_batch.
-        for rp in await pull(max_inflight_prompts):
-            running.add(asyncio.create_task(self._run_one(rp)))
+        pull_task: Optional[asyncio.Task] = None
+        stopping = False
 
         while True:
-            done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-            push_list: list[RolloutPrompt] = [t.result() for t in done]
-            running -= done
-            # Fire-and-forget; amortizes the RPC round-trip into the next pull.
-            push(push_list)
-            # Refill by exactly the count we just freed. Blocks if pending is
-            # empty; resumes when push_batch sets _prompts_pending.
-            for rp in await pull(len(push_list)):
-                running.add(asyncio.create_task(self._run_one(rp)))
+            # Keep one pull in flight whenever capacity allows. The pull itself
+            # blocks on an asyncio.Event in the manager when `pending_queue` is
+            # empty, so an in-flight pull is free.
+            if not stopping and pull_task is None:
+                remaining = max_inflight_prompts - len(running)
+                if remaining > 0:
+                    pull_task = asyncio.ensure_future(pull(remaining))
+
+            wait_set: set[asyncio.Task] = set(running)
+            if pull_task is not None:
+                wait_set.add(pull_task)
+
+            if not wait_set:
+                # Stopping with nothing left in flight — drained, exit.
+                return
+
+            done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+
+            push_list: list[RolloutPrompt] = []
+            for t in done:
+                if t is pull_task:
+                    rps = t.result()
+                    if not rps:
+                        # Shutdown signal from the manager: stop issuing pulls
+                        # and let `running` drain.
+                        stopping = True
+                    else:
+                        for rp in rps:
+                            running.add(asyncio.create_task(self._run_one(rp)))
+                    pull_task = None
+                else:
+                    running.discard(t)
+                    push_list.append(t.result())
+
+            if push_list:
+                # Fire-and-forget; doesn't block the next pull.
+                push(push_list)
 
     async def _run_one(self, rp: RolloutPrompt) -> RolloutPrompt:
         rp.gen_batch_output = await super().generate_sequences(rp.gen_batch_output)
@@ -115,6 +151,9 @@ class PRv3AgentLoopManager(AgentLoopManager):
         # generate_sequences / cancel / resume is a programming error.
         self.rollout_prompt_manager: Optional[ray.actor.ActorHandle] = None
         self.llm_server_manager = None
+        # ObjectRefs for each worker's run_continuous loop. Populated by
+        # init_agent_loop_workers, awaited (gathered) by shutdown.
+        self._worker_loop_refs: list = []
 
     @classmethod
     @auto_await
@@ -215,10 +254,29 @@ class PRv3AgentLoopManager(AgentLoopManager):
         await self.cancel()
         return output
 
-    @auto_await
     async def cancel(self):
         await self.llm_server_manager.cancel()
 
-    @auto_await
     async def resume(self):
         await self.llm_server_manager.resume()
+
+    @auto_await
+    async def shutdown(self) -> None:
+        """Stop workers' continuous loops and join their `run_continuous` refs.
+
+        Flow: signal the prompt manager (its `_stopped` flag flips, blocked
+        `pull_prompts` calls wake and return `[]`); workers read the empty
+        list, stop pulling, drain the rollouts already in flight pushing each
+        back, and `run_continuous` returns. We `asyncio.gather` the stored
+        ObjectRefs so the trainer can synchronize on full drain before
+        destroying the actors. Idempotent — second call is a no-op once refs
+        are cleared.
+
+        `return_exceptions=True`: one worker failing shouldn't strand the
+        others mid-drain; the drain is best-effort by design.
+        """
+        if not self._worker_loop_refs:
+            return
+        await self.rollout_prompt_manager.stop.remote()
+        await asyncio.gather(*self._worker_loop_refs, return_exceptions=True)
+        self._worker_loop_refs = []

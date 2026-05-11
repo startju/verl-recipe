@@ -98,6 +98,9 @@ class RolloutPromptManager:
         # sleep/poll with a one-way notification — idle workers consume zero
         # CPU and there are no per-empty-pull Ray RPCs.
         self._prompts_pending: asyncio.Event = asyncio.Event()
+        # Latched by stop(); pull_prompts returns [] once pending_queue is
+        # drained, which the worker reads as its shutdown signal.
+        self._stopped: bool = False
 
     def _maybe_signal_batch_ready(self) -> None:
         # Single edge for any push that may have grown done_queue to threshold.
@@ -221,12 +224,16 @@ class RolloutPromptManager:
 
     async def pull_prompts(self, prompt_count: int) -> list[RolloutPrompt]:
         """Block until push_batch has added at least one prompt, then move up
-        to `prompt_count` prompts from pending → ongoing.
+        to `prompt_count` prompts from pending → ongoing. Returns `[]` once
+        `stop()` has been called and pending_queue is empty — workers read
+        the empty list as their shutdown signal.
 
         Outer `while` handles two workers waking from one `set()`: whoever runs
         first drains, the loser re-blocks on the next push_batch's set().
         """
         while not self.pending_queue:
+            if self._stopped:
+                return []
             await self._prompts_pending.wait()
 
         for prompt in self.pending_queue:
@@ -241,6 +248,16 @@ class RolloutPromptManager:
         if not self.pending_queue:
             self._prompts_pending.clear()
         return pending_prompts
+
+    def stop(self) -> None:
+        """Trigger graceful shutdown of all workers. After this returns,
+        further `push_batch` calls are still legal (those prompts will be
+        served), but once pending_queue drains, `pull_prompts` returns `[]`
+        which the worker treats as its exit signal. `_prompts_pending.set()`
+        wakes anyone currently blocked inside `pull_prompts`. Idempotent.
+        """
+        self._stopped = True
+        self._prompts_pending.set()
 
     def push_prompts(self, prompts: list[RolloutPrompt]) -> None:
         """Return fully-rolled-out prompts from a worker; ongoing_set → done_queue.
