@@ -73,7 +73,7 @@ Skip it when:
 4. **Continuous worker loop**: each `PRv3AgentLoopWorker` runs `run_continuous` for the actor's lifetime, keeping one pull RPC in flight as an `asyncio.Task` alongside up to `max_inflight_prompts` rollouts. Pulls and completions share a single `asyncio.wait`, so completed rollouts get pushed back immediately without waiting on the pull RPC.
 5. **The dummy `gen_batch` must carry `uid`**: when the dataloader is exhausted at the end of an epoch, the placeholder batch built to drain in-flight prompts still needs `non_tensor_batch["uid"]`, otherwise the manager can't compute the row count.
 6. **Stateful dataloader resume**: `PRv3RayPPOTrainer.fit()` resumes via the stateful dataloader automatically — **don't** add manual skip-on-resume logic.
-7. **Graceful shutdown**: `RolloutPromptManager.stop()` flips `_stopped`; once set, `pull_prompts` returns `[]`. Workers' `run_continuous` reads this as a shutdown signal, cancels every in-flight rollout task, and returns. The cancel is necessary because the last step's `cancel()` left vLLM paused — rollouts blocked inside `FullyLLMServerClient`'s retry-on-abort loop need `CancelledError` to exit (no next-step `resume()` is coming at training end).
+7. **Graceful shutdown**: `RolloutPromptManager.stop()` sets `_stop_event`. Each worker's `run_continuous` holds a `stop_task` awaiting `wait_until_stop.remote()` on a dedicated RPC channel; when it fires, the worker cancels every in-flight rollout and returns. The cancel is necessary because the last step's `cancel()` left vLLM paused — rollouts blocked inside `FullyLLMServerClient`'s retry-on-abort loop need `CancelledError` to exit (no next-step `resume()` is coming at training end).
 
 ---
 

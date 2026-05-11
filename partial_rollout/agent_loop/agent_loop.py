@@ -43,7 +43,7 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         llm_client: LLMServerClient,
         prompt_manager_handle: ray.actor.ActorHandle,
         teacher_client: Optional[dict[str, LLMServerClient]] = None,
-        reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        reward_loop_worker_handles: Optional[list[ray.actor.ActorHandle]] = None,
     ):
         super().__init__(config, llm_client, teacher_client, reward_loop_worker_handles)
         self.prompt_manager_handle = prompt_manager_handle
@@ -137,7 +137,7 @@ class PRv3AgentLoopManager(AgentLoopManager):
         config: DictConfig,
         llm_client: LLMServerClient,
         teacher_client: Optional[dict[str, LLMServerClient]] = None,
-        reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        reward_loop_worker_handles: Optional[list[ray.actor.ActorHandle]] = None,
     ):
         self.agent_loop_workers_class = PRv3AgentLoopWorker
         super().__init__(config, llm_client, teacher_client, reward_loop_worker_handles)
@@ -262,26 +262,20 @@ class PRv3AgentLoopManager(AgentLoopManager):
     async def shutdown(self) -> None:
         """Stop workers' continuous loops and join their `run_continuous` refs.
 
-        Flow: signal the prompt manager (its `_stopped` flag flips, blocked
-        `pull_prompts` calls wake and return `[]`); workers read the empty
-        list, stop pulling, drain the rollouts already in flight pushing each
-        back, and `run_continuous` returns. We `asyncio.gather` the stored
-        ObjectRefs so the trainer can synchronize on full drain before
-        destroying the actors. Idempotent — second call is a no-op once refs
-        are cleared.
+        Flow: `stop()` sets `_stop_event` on the prompt manager; each worker's
+        `stop_task` (awaiting `wait_until_stop`) fires; the worker cancels its
+        in-flight rollouts (most likely blocked inside `FullyLLMServerClient
+        .generate()`'s retry-on-abort loop waiting for a next-step `resume()`
+        that won't come); `CancelledError` unblocks the retry loop;
+        `run_continuous` returns. We `asyncio.gather` the stored ObjectRefs
+        so the trainer can synchronize on full shutdown before destroying the
+        actors. Idempotent — second call is a no-op once refs are cleared.
 
         `return_exceptions=True`: one worker failing shouldn't strand the
-        others mid-drain; the drain is best-effort by design.
+        others mid-shutdown; the shutdown is best-effort by design.
         """
         if not self._worker_loop_refs:
             return
-        # `stop()` flips `_stopped` on the prompt manager and wakes any
-        # blocked `pull_prompts` callers — they return []. Workers read the
-        # empty list, cancel their in-flight rollouts (which may be blocked
-        # inside `FullyLLMServerClient.generate()`'s retry-on-abort loop
-        # waiting for a `resume()` that will never come), then return from
-        # `run_continuous`. No need to resume vLLM here: CancelledError
-        # unblocks the retry loop without it.
         await self.rollout_prompt_manager.stop.remote()
         await asyncio.gather(*self._worker_loop_refs, return_exceptions=True)
         self._worker_loop_refs = []
