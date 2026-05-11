@@ -68,34 +68,30 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         a next-step `resume()` that won't come at training end). The
         `CancelledError` unblocks the retry loop; tasks finish; loop exits.
         """
-        # `running` holds rollout tasks + at most one pull task.
-        # `stop_task` is the shutdown-signal RPC, kept out of `running` so it
-        # doesn't count against the rollout capacity budget.
+        # `running` holds every task we await: rollouts, at most one pull
+        # task, and the shutdown-signal `stop_task`. Capacity calc subtracts
+        # `pull_task` and `stop_task` so only rollouts count against
+        # `max_inflight_prompts`.
         pull = self.prompt_manager_handle.pull_prompts.remote
         push = self.prompt_manager_handle.push_prompts.remote
-        running: set[asyncio.Task] = set()
-        pull_task: Optional[asyncio.Task] = None
         stop_task: asyncio.Task = asyncio.ensure_future(self.prompt_manager_handle.wait_until_stop.remote())
+        running: set[asyncio.Task] = {stop_task}
+        pull_task: Optional[asyncio.Task] = None
         stopping = False
 
-        while running or not stopping:
-            if not stopping and pull_task is None and len(running) < max_inflight_prompts:
-                pull_task = asyncio.ensure_future(pull(max_inflight_prompts - len(running)))
+        while running:
+            rollouts = len(running) - (stop_task in running) - (pull_task in running)
+            if not stopping and pull_task is None and rollouts < max_inflight_prompts:
+                pull_task = asyncio.ensure_future(pull(max_inflight_prompts - rollouts))
                 running.add(pull_task)
 
-            wait_set = set(running)
-            if not stopping:
-                wait_set.add(stop_task)
-            done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
-            running -= done  # stop_task isn't in `running`, so this only removes rollouts/pull
+            done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+            running -= done
 
             push_list: list[RolloutPrompt] = []
             for t in done:
                 if t is stop_task:
                     stopping = True
-                    # Cancel rollouts only — pull_task returns naturally via
-                    # `_prompts_pending` set in stop(); stop_task isn't in
-                    # `running` anyway.
                     for task in running:
                         if task not in (pull_task, stop_task):
                             task.cancel()
