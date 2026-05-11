@@ -107,9 +107,10 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
         finally:
             upstream_ray_trainer.LLMServerManager = original_lsm
 
-        # PRv3AgentLoopManager.create defers worker spawn until the prompt
-        # manager is available; provide it here.
-        self.async_rollout_manager.init_agent_loop_workers(self.rollout_prompt_manager)
+        # PRv3AgentLoopManager.create defers worker spawn until both the prompt
+        # manager and the LLMServerManager (for cancel/resume around
+        # update_weights) are available; provide them here.
+        self.async_rollout_manager.init_agent_loop_workers(self.rollout_prompt_manager, self.llm_server_manager)
 
     def _fit_generate(self, data_loader_iter) -> DataProto:
         metrics = self.metrics

@@ -12,26 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 
 
 class PRv3LLMServerManager(LLMServerManager):
-    """LLMServerManager override that forces every `get_client()` caller to
-    receive the retry-on-abort client (upstream `FullyLLMServerClient`).
+    """LLMServerManager override for PRv3.
 
-    PRv3's abort/resume cycle around `update_weights` is owned by
-    `verl/checkpoint_engine/base.py` (abort_all_requests + resume_generation
-    bracket the weight transfer), and the retry-on-abort is gated on
-    `config.async_training.partial_rollout=True` — set in the run scripts
-    via `+async_training.partial_rollout=True`. There is no PRv3-side
-    cancel/resume plumbing.
+    Two PRv3-specific additions on top of upstream:
 
-    This subclass exists only because `RayPPOTrainer.init_workers` calls
-    `self.llm_server_manager.get_client()` with no `fully_async` arg
-    (defaults False), and there's no upstream config knob to switch the
-    default. The trainer monkey-patches `LLMServerManager` to this subclass
-    for the duration of `init_workers` (ray_trainer.py).
+    1. `get_client(fully_async=True)` is forced so every caller — including
+       `RayPPOTrainer.init_workers`, which calls `get_client()` with no arg
+       (defaults False) — receives the retry-on-abort `FullyLLMServerClient`.
+       The retry loop is gated on `config.async_training.partial_rollout=True`,
+       set in the run scripts via `+async_training.partial_rollout=True`.
+
+    2. `cancel` / `resume` route to upstream `vLLMReplica.abort_all_requests`
+       (vLLM `pause_generation` + abort) and `resume_generation`. The trainer
+       brackets `update_weights` with these so PRv3's continuously-running
+       workers don't generate trajectories that straddle a weight update.
+       Upstream's `checkpoint_engine` only brackets abort/resume in non-naive
+       backends (`base.py: if self.backend == "naive": return` short-circuits
+       before the abort); PRv3 uses the naive backend by default, so it must
+       wire this itself.
+
+    The subclass is installed via a monkey-patch in `PRv3RayPPOTrainer
+    .init_workers` because `RayPPOTrainer.init_workers` hardcodes
+    `LLMServerManager.create(...)` and has no FQN config knob.
     """
 
     def get_client(self, fully_async: bool = False) -> LLMServerClient:
         return super().get_client(fully_async=True)
+
+    async def cancel(self):
+        await asyncio.gather(*[replica.abort_all_requests() for replica in self.rollout_replicas])
+
+    async def resume(self):
+        await asyncio.gather(*[replica.resume_generation() for replica in self.rollout_replicas])
