@@ -100,9 +100,14 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
                             task.cancel()
                 elif t is pull_task:
                     pull_task = None
-                    # Skip spawn if stop_task fired this iter (set order race).
-                    if not stopping:
-                        running.update(asyncio.create_task(self._run_one(p)) for p in t.result())
+                    rps = t.result()
+                    if rps and not stopping:
+                        running.update(asyncio.create_task(self._run_one(p)) for p in rps)
+                    elif not rps:
+                        # Empty pull == manager stopped; mirror stop_task branch.
+                        stopping = True
+                        for task in running:
+                            task.cancel()
                 elif not t.cancelled():
                     push_list.append(t.result())
 
