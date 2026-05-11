@@ -82,7 +82,7 @@ Three actors coordinated by one Ray actor scheduler:
 
 Single-turn:
 ```bash
-bash recipe/partial_rollout/shell/run_qwen3-0.6b_gsm8k_grpo.sh
+bash recipe/partial_rollout/run/run_qwen3-0.6b_gsm8k_grpo.sh
 ```
 
 Multi-turn with tool calls — first generate the tool-agent dataset:
@@ -92,15 +92,15 @@ python3 examples/data_preprocess/gsm8k_multiturn_w_tool.py \
 ```
 then launch:
 ```bash
-bash recipe/partial_rollout/shell/run_qwen3-0.6b_gsm8k_grpo_tool.sh
+bash recipe/partial_rollout/run/run_qwen3-0.6b_gsm8k_grpo_tool.sh
 ```
 
 ### Baseline runs (vanilla GRPO, for A/B against partial rollout)
 
 Same model / data / batch / hyperparameters; the only differences from the PR variants are the upstream entry, the upstream agent loop, and no IS correction:
 ```bash
-bash recipe/partial_rollout/shell/run_qwen3-0.6b_gsm8k_grpo_baseline.sh
-bash recipe/partial_rollout/shell/run_qwen3-0.6b_gsm8k_grpo_tool_baseline.sh
+bash recipe/partial_rollout/run/run_qwen3-0.6b_gsm8k_grpo_baseline.sh
+bash recipe/partial_rollout/run/run_qwen3-0.6b_gsm8k_grpo_tool_baseline.sh
 ```
 
 ### PRv3-specific Hydra overrides
