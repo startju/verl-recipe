@@ -42,6 +42,11 @@ class PRv3vLLMHttpServer(vLLMHttpServer):
     `abort_all_requests(reset_prefix_cache=False)` in a loop until any
     in-flight requests that beat the gate have drained. `resume()` sets
     the gate; all queued callers proceed at once.
+
+    TODO: drop this whole wrapper (and the `rollout_replica_class` swap in
+    `PRv3LLMServerManager`) once verl's minimum vLLM is ≥0.12 — upstream's
+    `pause_generation(wait_for_inflight_requests=False)` provides the same
+    gate-then-drain semantics at the engine layer.
     """
 
     def __init__(self, *args, **kwargs):
