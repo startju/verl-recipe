@@ -19,19 +19,17 @@
 - 数据集**响应长度分布长尾**（少量超长样本拖慢整批 step）
 - 同步 PPO/GRPO 因等待长尾样本导致 GPU bubble 明显
 - 训练对**轻微 off-policy** 容忍（partial rollout 必然引入 weight-version 跨越，需配合 IS 修正）
-- 多轮 / tool-call 场景里 vLLM 服务端能被中断（需要 PRv3vLLMHttpServer 替代上游 server）
+- 多轮 / tool-call 场景 —— 上游 vLLM ≥ 0.12 的 `pause_generation` + abort 已经够用，本 recipe 不 fork server
 
 不适用：
 
 - 响应长度均匀、没有 long-tail bubble — 同步 trainer 更简单
 - 严格 on-policy 必须保证（每个 trajectory 只能由当前权重产出）
-- 同时使用本流水线 + 上游 sync trainer 的 batch shape 假设（dummy gen_batch / `last_agent_loop_output` 等 PRv3 专属字段会破坏）
+- 同时使用本流水线 + 上游 sync trainer 的 batch shape 假设（dummy gen_batch、continuous-worker 语义会破坏）
 
 ---
 
 ## 整体架构
-
-三个角色，靠一个 Ray actor 做调度：
 
 ```
                  trainer (PRv3RayPPOTrainer)
@@ -41,36 +39,39 @@
          ┌──────────────────────────────────┐
          │   RolloutPromptManager (Ray)     │
          │                                  │
-         │   pending  ─pull─►  ongoing      │
-         │      ▲                │          │
-         │      └─aborted──push──┴─done─►   │
+         │   pending ─pull─► ongoing ─push─► done
          └──────────────────────────────────┘
                         │
             pull_prompts│push_prompts
                         ▼
-              PRv3AgentLoopWorker  ×N
+              PRv3AgentLoopWorker  ×N   (run_continuous 持续循环)
                         │
-              vLLM HTTP │ generate / cancel / resume
+              llm_client│ generate (FullyLLMServerClient retry aborted)
                         ▼
-              PRv3vLLMHttpServer  ×replicas
+                upstream vLLMReplica  ×replicas
+                        ▲
+              cancel/   │
+              resume    │
+                        │
+              PRv3LLMServerManager  (pause_generation / resume_generation)
 ```
 
-- **`PRv3RayPPOTrainer`** (`ray_trainer.py`)：trainer 主循环。`_fit_generate` 把 prompt push 进 manager，调 `async_rollout_manager.generate_sequences` 等一个完整 batch 回来，再走 log_prob / advantage / policy update。
-- **`RolloutPromptManager`** (`prompt_manager.py`)：单线程 Ray actor，维护三个数据结构（pending / ongoing / done_queue），保证不丢 prompt、不重复入队。`pull_batch` 是 async + `asyncio.Event` 驱动，无 busy poll。`pull_prompts(traj_count)` 按 trajectory 数控配额（用 `get_unfinished_traj_count` 算每个 prompt 的剩余未完 traj），partial prompt 只占其剩余 aborted-traj 那部分预算，而不是固定的 `n`。
-- **`PRv3AgentLoopManager` / `PRv3AgentLoopWorker`** (`agent_loop/agent_loop.py`)：管理 agent loop worker 池。manager 负责调度 + cancel/resume vLLM；worker 拉 prompt、跑 agent loop、把结果回 push。worker 用 `dict[Task, int]` 记录每个 task 拉时占用的 traj 预算，prompt 完成后用记录值精准 refill（而不是简单 `n × len(done)`）。
-- **`PRv3SingleTurnAgentLoop` / `PRv3ToolAgentLoop`** (`agent_loop/`)：上游 agent loop 的 partial-rollout 改造版。每次执行前看 `last_agent_loop_output`：完成态直接放行；aborted 状态从中断点续跑（拼接前轮 prompt+response 当新输入）。
-- **`PRv3vLLMHttpServer` / `PRv3vLLMReplica`** (`vllm_rollout/vllm_async_server.py`)：上游 vLLM HTTP server 的扩展，加 `cancel()` / `resume()` 和 `paused` 闸门。`cancel()` 翻 `paused=True`，循环调 vLLM 的 `abort_all_requests`（engine-level 批量 abort）直到 in-flight 清空 —— 一次 engine-core 调用替代旧版逐请求 cancel。每个 in-flight `generate()` 拿到 ABORT `TokenOutput` 自然返回。
+- **`PRv3RayPPOTrainer`** (`ray_trainer.py`)：trainer 主循环。`_fit_generate` 把 prompt push 进 manager，调 `async_rollout_manager.generate_sequences` 等一个完整 batch 回来，再走 log_prob / advantage / policy update / `update_weights`。`fit()` 在每个 return 前调 `async_rollout_manager.shutdown()` 让 workers 干净退出。
+- **`RolloutPromptManager`** (`prompt_manager.py`)：单线程 Ray actor，维护三个队列（pending / ongoing / done）。`pull_batch` 和 `pull_prompts` 都用 `asyncio.Event` 阻塞 —— 无 busy poll，无空 pull 的 RPC。`stop()` 翻 `_stopped`，之后 `pull_prompts` 立刻返回 `[]`，worker 据此识别 shutdown。
+- **`PRv3AgentLoopManager` / `PRv3AgentLoopWorker`** (`agent_loop/agent_loop.py`)：worker 跑常驻 `run_continuous` 循环，把一个 pull RPC 当 task 跟 rollout 任务一起塞进同一个 `asyncio.wait`，capacity 上限是 `max_inflight_prompts`。完成的 rollout 不用等 pull 返回就能 push 回去。Manager 暴露 `cancel()` / `resume()`（委托给 `PRv3LLMServerManager`）让 trainer 包住 `update_weights`，以及 `shutdown()` 用于优雅退出。每个 prompt 的具体 rollout 直接调用上游 `AgentLoopWorker.generate_sequences`。
+- **`PRv3LLMServerManager`** (`llm_server.py`)：上游 `LLMServerManager` 的薄壳子类。强制 `get_client(fully_async=True)`，让所有 caller 拿到带 retry-on-abort 的 `FullyLLMServerClient`；并暴露 `cancel` / `resume`，分别 fan out 到每个 `vLLMReplica.abort_all_requests` / `resume_generation`。因为上游没有 `LLMServerManager` 的 FQN 配置开关，所以在 `PRv3RayPPOTrainer.init_workers` 里 monkey-patch 替换。
 
 ---
 
 ## 关键不变量
 
-1. **prompt 流转的所有权**：每个 prompt 同一时刻只在 pending / ongoing / done 之一。`pull_prompts` 移 pending→ongoing；`push_prompts` 按 `is_prompt_done` 决定 ongoing→done 还是 ongoing→pending（aborted 续跑）。
-2. **`stop_reason == "aborted"` 是续跑信号**：其它（含 `missing` / `None`）一律视为完成（设计如此，不是 bug）。改 `is_prompt_done` 前先看 `prompt_manager.py` 注释。
-3. **inflight 是按 trajectory 数控制，不是 prompt 数**：`pull_prompts(traj_count)` 按累计未完 traj 拉到预算用尽；同一个 traj 预算下，partial prompt 因为剩余 aborted 少，可以多塞几个进 worker，traj 总量保持不变。
-4. **PRv3 agent loop 通过 kwargs 续跑**：训练路径 `kwargs["last_agent_loop_output"]` 必传；validate 路径不传，PRv3 子类靠 `kwargs["_prv3_is_validate"]` 退化到上游实现。
+1. **prompt 流转的所有权**：每个 prompt 同一时刻只在 pending / ongoing / done 之一。`pull_prompts` 移 pending→ongoing；`push_prompts` 只走 ongoing→done。没有 aborted-回 pending 的二次入队，因为 `FullyLLMServerClient.generate()` 在单次 generate 调用内部就把 abort/retry 吸收了。
+2. **跨 step 的 abort/resume 包装**：`PRv3AgentLoopManager.generate_sequences` 开头 `await self.resume()`，`pull_batch` 拿到完整 batch 后 `await self.cancel()`。naive `checkpoint_engine` backend（PRv3 默认）会跳过自己的 abort，所以这一步必须由 recipe 自己来；worker 的 `client.generate(...)` 被 abort 后在 `FullyLLMServerClient` retry 循环里等下一个 step 的 `resume()`。
+3. **per-sample weight-version 跟踪**：放在 `gen_batch.meta_info["global_steps"]`（trainer 写）和 `FullyLLMServerClient.generate()`（记录每次 retry 真正提交时的版本）里。worker 自己不做版本跟踪。
+4. **持续 worker 循环**：每个 `PRv3AgentLoopWorker` 跑 `run_continuous` 直到 actor 销毁；把一个 pull RPC 当 `asyncio.Task` 跟最多 `max_inflight_prompts` 个 rollout 任务一起塞进同一个 `asyncio.wait`。完成的 rollout 不用等 pull 返回就能 push 回去。
 5. **dummy gen_batch 也要带 uid**：epoch 末 dataloader 耗尽时构造的占位 batch 必须填 `non_tensor_batch["uid"]`，否则 manager 端取不到行数。
 6. **stateful dataloader 续训**：`PRv3RayPPOTrainer.fit()` 走 stateful loader 自动恢复进度，**不要**手工加 skip-on-resume 逻辑。
+7. **优雅退出**：`RolloutPromptManager.stop()` 翻 `_stopped`，之后 `pull_prompts` 立刻返回 `[]`。worker 的 `run_continuous` 收到 `[]` 就把还在跑的 rollout 全部 `task.cancel()` 然后返回。cancel 是必需的：最后一个 step 的 `cancel()` 把 vLLM 留在 paused 状态，rollout 卡在 `FullyLLMServerClient` retry 循环里等不到下一个 `resume()`，靠 `CancelledError` 才能把它们放出来。
 
 ---
 

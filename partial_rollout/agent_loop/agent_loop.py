@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import logging
 from typing import Optional
 from uuid import uuid4
 
@@ -24,10 +23,7 @@ from recipe.partial_rollout.prompt_manager import RolloutPrompt
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AgentLoopWorker
 from verl.protocol import DataProto
 from verl.utils.ray_utils import auto_await
-from verl.workers.rollout.llm_server import LLMServerClient
-
-logger = logging.getLogger(__file__)
-logger.setLevel("INFO")
+from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 
 
 @ray.remote
@@ -65,43 +61,45 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         oblivious to the cancel/resume cycle the manager wires around
         `update_weights`.
 
-        Exit: an empty list from `pull_prompts` is the shutdown signal — the
-        prompt manager returns `[]` only when it has been stopped (see
-        `RolloutPromptManager.stop`). We then stop issuing new pulls, drain
-        the rollouts already in flight (pushing each back), and return.
+        Exit: a separate `stop_task` awaits `RolloutPromptManager
+        .wait_until_stop` on its own RPC channel. When it fires, we cancel
+        every in-flight rollout (most likely blocked inside
+        `FullyLLMServerClient.generate()`'s retry-on-abort loop, waiting for
+        a next-step `resume()` that won't come at training end). The
+        `CancelledError` unblocks the retry loop; tasks finish; loop exits.
         """
-        # `running` holds every asyncio.Task we await — rollout tasks plus at
-        # most one pull task. The pull-creation branch only enters when
-        # `pull_task is None`, so `len(running)` there counts rollouts only.
+        # `running` holds rollout tasks + at most one pull task.
+        # `stop_task` is the shutdown-signal RPC, kept out of `running` so it
+        # doesn't count against the rollout capacity budget.
         pull = self.prompt_manager_handle.pull_prompts.remote
         push = self.prompt_manager_handle.push_prompts.remote
         running: set[asyncio.Task] = set()
         pull_task: Optional[asyncio.Task] = None
+        stop_task: asyncio.Task = asyncio.ensure_future(self.prompt_manager_handle.wait_until_stop.remote())
         stopping = False
 
         while running or not stopping:
-            # Keep one pull in flight whenever capacity allows. The pull
-            # blocks on an asyncio.Event in the manager when `pending_queue`
-            # is empty, so an in-flight pull is free.
             if not stopping and pull_task is None and len(running) < max_inflight_prompts:
                 pull_task = asyncio.ensure_future(pull(max_inflight_prompts - len(running)))
                 running.add(pull_task)
 
-            done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-            running -= done
+            wait_set = set(running)
+            if not stopping:
+                wait_set.add(stop_task)
+            done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+            running -= done  # stop_task isn't in `running`, so this only removes rollouts/pull
 
             push_list: list[RolloutPrompt] = []
             for t in done:
-                if t is pull_task:
+                if t is stop_task:
+                    stopping = True
+                    for task in running:
+                        task.cancel()
+                elif t is pull_task:
                     pull_task = None
-                    rps = t.result()
-                    if rps:
-                        running.update(asyncio.create_task(self._run_one(p)) for p in rps)
-                    else:
-                        # Shutdown signal from the manager: stop issuing pulls
-                        # and let `running` drain.
-                        stopping = True
-                else:
+                    if not t.cancelled():
+                        running.update(asyncio.create_task(self._run_one(p)) for p in t.result())
+                elif not t.cancelled():
                     push_list.append(t.result())
 
             if push_list:
@@ -142,10 +140,10 @@ class PRv3AgentLoopManager(AgentLoopManager):
         # Set by the trainer via init_agent_loop_workers; until then, calling
         # generate_sequences / cancel / resume is a programming error.
         self.rollout_prompt_manager: Optional[ray.actor.ActorHandle] = None
-        self.llm_server_manager = None
+        self.llm_server_manager: Optional[LLMServerManager] = None
         # ObjectRefs for each worker's run_continuous loop. Populated by
         # init_agent_loop_workers, awaited (gathered) by shutdown.
-        self._worker_loop_refs: list = []
+        self._worker_loop_refs: list[ray.ObjectRef] = []
 
     @classmethod
     @auto_await
@@ -161,7 +159,11 @@ class PRv3AgentLoopManager(AgentLoopManager):
         return cls(*args, **kwargs)
 
     @auto_await
-    async def init_agent_loop_workers(self, rollout_prompt_manager, llm_server_manager):
+    async def init_agent_loop_workers(
+        self,
+        rollout_prompt_manager: ray.actor.ActorHandle,
+        llm_server_manager: LLMServerManager,
+    ):
         self.rollout_prompt_manager = rollout_prompt_manager
         self.llm_server_manager = llm_server_manager
         await self._init_agent_loop_workers()
@@ -269,6 +271,13 @@ class PRv3AgentLoopManager(AgentLoopManager):
         """
         if not self._worker_loop_refs:
             return
+        # `stop()` flips `_stopped` on the prompt manager and wakes any
+        # blocked `pull_prompts` callers — they return []. Workers read the
+        # empty list, cancel their in-flight rollouts (which may be blocked
+        # inside `FullyLLMServerClient.generate()`'s retry-on-abort loop
+        # waiting for a `resume()` that will never come), then return from
+        # `run_continuous`. No need to resume vLLM here: CancelledError
+        # unblocks the retry loop without it.
         await self.rollout_prompt_manager.stop.remote()
         await asyncio.gather(*self._worker_loop_refs, return_exceptions=True)
         self._worker_loop_refs = []

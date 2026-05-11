@@ -166,14 +166,14 @@ In the current implementation, we use AgentLoop mode, which also supports multi-
 ## 3.Usage
 ### GSM8K Configuration Example
 ```shell
-bash recipe/partial_rollout/run_gsm8k_nopr_4b_bs128.sh
-bash recipe/partial_rollout/run_gsm8k_pr_4b_bs128.sh
+bash recipe/partial_rollout/run/run_gsm8k_nopr_grpo_4b_bs128.sh
+bash recipe/partial_rollout/run/run_gsm8k_pr_grpo_4b_bs128.sh
 ```
 
 ### DAPO_MATH Configuration Example
 ```shell
-bash recipe/partial_rollout/run_dapo_math17k_nopr_4b_2node.sh
-bash recipe/partial_rollout/run_dapo_math17k_pr_4b_2node.sh
+bash recipe/partial_rollout/run/run_dapomath_nopr_grpo_4b_bs64.sh
+bash recipe/partial_rollout/run/run_dapomath_pr_grpo_4b_bs64.sh
 ```
 
 ## 4. Functional Support
