@@ -227,88 +227,82 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
 
         from verl.utils.tracking import Tracking
 
-        # try/finally so the continuous PRv3 workers get joined on every exit
-        # path — val_only return, resume-already-finished return, is_last_step
-        # return, or any exception. Without the join, run_continuous loops
-        # would outlive `fit()` and the actor wouldn't shut down cleanly.
-        try:
-            self.logger = Tracking(
-                project_name=self.config.trainer.project_name,
-                experiment_name=self.config.trainer.experiment_name,
-                default_backend=self.config.trainer.logger,
-                config=OmegaConf.to_container(self.config, resolve=True),
-            )
+        self.logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
 
-            self.global_steps = 0
+        self.global_steps = 0
 
-            # load checkpoint and update weights before doing anything
-            self._load_checkpoint()
-            self.checkpoint_manager.update_weights(self.global_steps)
+        # load checkpoint and update weights before doing anything
+        self._load_checkpoint()
+        self.checkpoint_manager.update_weights(self.global_steps)
 
-            current_epoch = self.global_steps // len(self.train_dataloader)
-            # Number of batches already consumed in current_epoch before the
-            # checkpoint was taken. On resume the stateful dataloader yields only
-            # `len - start_in_epoch` batches for the current epoch, so the inner
-            # loop below caps at that count for the resumed epoch.
-            start_in_epoch = self.global_steps % len(self.train_dataloader)
+        current_epoch = self.global_steps // len(self.train_dataloader)
+        # Number of batches already consumed in current_epoch before the
+        # checkpoint was taken. On resume the stateful dataloader yields only
+        # `len - start_in_epoch` batches for the current epoch, so the inner
+        # loop below caps at that count for the resumed epoch.
+        start_in_epoch = self.global_steps % len(self.train_dataloader)
 
-            # perform validation before training
-            # currently, we only support validation using the reward_function.
-            if self.config.trainer.get("val_before_train", True):
-                val_metrics = self._validate()
-                assert val_metrics, f"{val_metrics=}"
-                pprint(f"Initial validation metrics: {val_metrics}")
-                self.logger.log(data=val_metrics, step=self.global_steps)
-                if self.config.trainer.get("val_only", False):
-                    return
-
-            if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
-                rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
-                rollout_skip.wrap_generate_sequences()
-
-            # add tqdm
-            self.progress_bar = tqdm(
-                total=self.total_training_steps, initial=self.global_steps, desc="Training Progress"
-            )
-
-            # we start from step 1
-            self.global_steps += 1
-            if self.global_steps > self.total_training_steps:
-                # Resumed from a checkpoint that already met or exceeded the
-                # configured limit; nothing left to do. Without this guard the loop
-                # below would unconditionally run one more step before checking
-                # is_last_step.
+        # perform validation before training
+        # currently, we only support validation using the reward_function.
+        if self.config.trainer.get("val_before_train", True):
+            val_metrics = self._validate()
+            assert val_metrics, f"{val_metrics=}"
+            pprint(f"Initial validation metrics: {val_metrics}")
+            self.logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                self.async_rollout_manager.shutdown()
                 return
-            self.last_val_metrics = None
-            self.max_steps_duration = 0
 
-            self.prev_step_profile = False
-            self.curr_step_profile = (
-                self.global_steps in self.config.global_profiler.steps
-                if self.config.global_profiler.steps is not None
-                else False
-            )
-            self.next_step_profile = False
+        if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
+            rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
+            rollout_skip.wrap_generate_sequences()
 
-            for epoch in range(current_epoch, self.config.trainer.total_epochs):
-                # Pass the iterator (not a batch_dict) so _fit_generate can consume
-                # multiple items per step under backpressure. Assumes a stateful
-                # dataloader: on resume, iter(self.train_dataloader) yields only
-                # the remaining batches in the current epoch, so no manual skip
-                # is needed — but the inner loop must also cap at the matching
-                # remaining count, otherwise the leftover iterations fall into
-                # the dummy gen_batch path and burn step counts. Subsequent
-                # epochs (epoch != current_epoch) run a full pass.
-                self.epoch = epoch
-                data_loader_iter = iter(self.train_dataloader)
-                remaining = len(self.train_dataloader) - (start_in_epoch if epoch == current_epoch else 0)
-                for _ in range(remaining):
-                    is_last_step = self.is_last_step
-                    self.fit_step(data_loader_iter)
-                    if is_last_step:
-                        return
-        finally:
+        # add tqdm
+        self.progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+        # we start from step 1
+        self.global_steps += 1
+        if self.global_steps > self.total_training_steps:
+            # Resumed from a checkpoint that already met or exceeded the
+            # configured limit; nothing left to do. Without this guard the loop
+            # below would unconditionally run one more step before checking
+            # is_last_step.
             self.async_rollout_manager.shutdown()
+            return
+        self.last_val_metrics = None
+        self.max_steps_duration = 0
+
+        self.prev_step_profile = False
+        self.curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        self.next_step_profile = False
+
+        for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            # Pass the iterator (not a batch_dict) so _fit_generate can consume
+            # multiple items per step under backpressure. Assumes a stateful
+            # dataloader: on resume, iter(self.train_dataloader) yields only
+            # the remaining batches in the current epoch, so no manual skip
+            # is needed — but the inner loop must also cap at the matching
+            # remaining count, otherwise the leftover iterations fall into
+            # the dummy gen_batch path and burn step counts. Subsequent
+            # epochs (epoch != current_epoch) run a full pass.
+            self.epoch = epoch
+            data_loader_iter = iter(self.train_dataloader)
+            remaining = len(self.train_dataloader) - (start_in_epoch if epoch == current_epoch else 0)
+            for _ in range(remaining):
+                is_last_step = self.is_last_step
+                self.fit_step(data_loader_iter)
+                if is_last_step:
+                    self.async_rollout_manager.shutdown()
+                    return
 
     def fit_step(self, data_loader_iter):
         self.metrics = {"training/global_step": self.global_steps, "training/epoch": self.epoch}
