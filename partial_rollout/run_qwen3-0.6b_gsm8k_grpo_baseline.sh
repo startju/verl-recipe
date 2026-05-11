@@ -5,7 +5,7 @@ set -xeo pipefail
 # NO partial rollout. Same model / dataset / batch / hyperparameters; the only
 # differences are:
 #   - python -m verl.trainer.main_ppo (upstream entry, not PRv3)
-#   - default_agent_loop=single_turn_agent (upstream loop, not prv3_*)
+#   - default_agent_loop=single_turn_agent 
 #   - same algorithm.rollout_correction.rollout_is settings as the PR variant
 #     so the loss path is apples-to-apples (baseline is on-policy so IS ratios
 #     are ~1, but keep the code path identical for cleaner A/B)

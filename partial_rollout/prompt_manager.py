@@ -21,7 +21,6 @@ from typing import Any
 import ray
 from omegaconf import DictConfig
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
 from verl.experimental.fully_async_policy.detach_utils import RolloutSample, assemble_batch_from_rollout_samples
 from verl.protocol import DataProto
 
@@ -34,50 +33,19 @@ _PREFETCH_FACTOR = 2
 
 @dataclass
 class RolloutPrompt:
-    """Enhanced rollout prompt (with n rollout samples) carrying generation state across partial rollouts."""
+    """A trainer-supplied prompt as it flows through the partial-rollout queue.
 
-    # Original (un-repeated) trainer batch. Repeated to n rows and unioned
-    # with gen_batch_output in pull_batch to form the final training batch
-    # (uid / agent_name / raw prompt fields live here; generation tensors
-    # live in gen_batch_output).
+    `batch` is the un-repeated trainer batch (one row); `gen_batch_output`
+    starts as the raw gen-side fields (prompt tokens etc., repeated n times)
+    and is replaced by the worker's postprocessed DataProto (prompts /
+    responses / response_mask / attention_mask / position_ids + meta_info
+    fields) once all n rollouts complete. `pull_batch` unions `batch.repeat(n)`
+    with `gen_batch_output` to form one training-side sample row.
+    """
+
     batch: DataProto
-
-    # Mutates across the prompt's lifetime:
-    #   - push_batch  : raw gen-side fields (prompt tokens etc.), n rows.
-    #   - worker side : replaced by AgentLoopWorker._postprocess(...) once the
-    #                   rollout completes — schema becomes the standard
-    #                   postprocessed one (prompts / responses / response_mask /
-    #                   attention_mask / position_ids + meta_info["metrics"] +
-    #                   fully_async fields like min_global_steps).
-    #   - pull_batch  : unioned with rp.batch.repeat(n) to form the training batch.
     gen_batch_output: DataProto
     prompt_id: str
-
-    # AgentLoopOutput from generation. Length is n while the prompt is being
-    # rolled out; once all n samples finish successfully the worker postprocesses
-    # them into gen_batch_output and clears this list to []. So:
-    #   - len == n  : in-flight or freshly pushed (sentinels)
-    #   - len == 0  : terminal, already postprocessed
-    # Both are valid states. is_prompt_done relies on this: an empty list
-    # vacuously returns True, which matches "fully done" semantics.
-    agent_loop_output_list: list[AgentLoopOutput]
-
-
-def is_prompt_done(prompt: RolloutPrompt) -> bool:
-    # A prompt is "done" iff none of its n samples were aborted mid-flight.
-    # Any other stop_reason (including missing / None / unknown values) is
-    # treated as a successful terminal state by design — only the explicit
-    # "aborted" sentinel from PRv3vLLMHttpServer triggers a requeue.
-    #
-    # Empty agent_loop_output_list also returns True (vacuous `not any([])`):
-    # this is intentional — the worker clears the list after postprocessing,
-    # so an empty list means "fully done, already postprocessed".
-    return not any(output.extra_fields["stop_reason"] == "aborted" for output in prompt.agent_loop_output_list)
-
-
-def get_unfinished_traj_count(prompt: RolloutPrompt) -> int:
-    """Count of n samples still aborted (i.e., need to be re-rolled out)."""
-    return sum(output.extra_fields["stop_reason"] == "aborted" for output in prompt.agent_loop_output_list)
 
 
 @ray.remote
@@ -86,24 +54,22 @@ class RolloutPromptManager:
 
     Three data structures track each prompt's state:
 
-      - pending_queue : prompts waiting for a worker. FIFO from the back
-                        (push_batch.append) and LIFO from the front
-                        (push_prompts.appendleft for aborted requeues, see
-                        push_prompts).
+      - pending_queue : prompts waiting for a worker (FIFO).
       - ongoing_set   : prompt_ids currently being rolled out by some worker.
-      - done_queue    : prompts whose n samples all reached a non-aborted
-                        stop_reason and are ready to be assembled.
+      - done_queue    : prompts whose n rollouts all completed and are ready
+                        to be assembled into a training batch.
 
     Transitions:
 
-      trainer → push_batch      : (new)         → pending_queue
-      worker  → pull_prompts    : pending_queue → ongoing_set
-      worker  → push_prompts    : ongoing_set   → done_queue       (if all done)
-                                : ongoing_set   → pending_queue.left (if any aborted)
-      trainer → pull_batch      : done_queue    → assembled DataProto
+      trainer → push_batch    : (new)         → pending_queue
+      worker  → pull_prompts  : pending_queue → ongoing_set
+      worker  → push_prompts  : ongoing_set   → done_queue
+      trainer → pull_batch    : done_queue    → assembled DataProto
 
-    Ray actors are single-threaded, so all method bodies execute serially —
-    no locking is needed inside this class.
+    `FullyLLMServerClient` makes abort/resume transparent at the LLM-client
+    layer, so workers always return fully-postprocessed prompts — there is no
+    `aborted → pending` re-queue path. Ray actors are single-threaded, so all
+    method bodies execute serially with no locking inside this class.
     """
 
     def __init__(self, config: DictConfig, tokenizer: Any):
@@ -115,11 +81,7 @@ class RolloutPromptManager:
         self.tokenizer = tokenizer
         self.batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
         self.n = self.config.actor_rollout_ref.rollout.n
-        # Fail-fast: invalid batch_size makes pull_batch silently never return,
-        # and n < 1 would make push_batch create RolloutPrompts with an empty
-        # sentinel list — which is_prompt_done treats as "fully done" (the
-        # postprocessed-terminal state), so a fresh prompt would skip rollout
-        # entirely and land in done_queue with no generation.
+        # Fail-fast: invalid batch_size makes pull_batch silently never return.
         assert self.batch_size > 0, f"batch_size must be > 0, got {self.batch_size}"
         assert self.n >= 1, f"rollout.n must be >= 1, got {self.n}"
         self.ongoing_set: set[str] = set()
@@ -131,6 +93,11 @@ class RolloutPromptManager:
         # the per-step ~10k empty Ray RPCs the manager used to fire while
         # waiting on the first batch's tail end.
         self._batch_ready: asyncio.Event = asyncio.Event()
+        # Set by push_batch when pending_queue gains prompts; cleared by
+        # pull_prompts when it drains pending. Replaces the worker-side
+        # sleep/poll with a one-way notification — idle workers consume zero
+        # CPU and there are no per-empty-pull Ray RPCs.
+        self._prompts_pending: asyncio.Event = asyncio.Event()
 
     def _maybe_signal_batch_ready(self) -> None:
         # Single edge for any push that may have grown done_queue to threshold.
@@ -189,32 +156,8 @@ class RolloutPromptManager:
                     batch=prompt_batch,
                     gen_batch_output=prompt_gen_batch.repeat(repeat_times=n, interleave=True),
                     prompt_id=prompt_ids[i],
-                    # Sentinel AgentLoopOutputs for a fresh prompt. Two signals
-                    # the first _run_agent_loop call relies on:
-                    #   - extra_fields["stop_reason"] == "aborted"  → not yet done,
-                    #     run a rollout (vs. passing a finished output through).
-                    #   - prompt_ids == []                          → fresh prompt
-                    #     (vs. resuming a previously-aborted partial generation).
-                    # All other fields are valid empties so the agent loop can
-                    # read them without AttributeError. The real AgentLoopOutput
-                    # overwrites this whole list once the worker finishes.
-                    agent_loop_output_list=[
-                        AgentLoopOutput(
-                            prompt_ids=[],
-                            response_ids=[],
-                            response_mask=[],
-                            metrics=AgentLoopMetrics(),
-                            extra_fields={"stop_reason": "aborted"},
-                        )
-                        for _ in range(n)
-                    ],
                 )
             )
-        # Push paths only grow done_queue indirectly (via push_prompts when an
-        # in-flight prompt finishes), but signal here too so a freshly-pushed
-        # batch that lands sentinels straight into done — should that ever
-        # happen — wakes a waiting pull_batch.
-        self._maybe_signal_batch_ready()
         # Backpressure: count total in-flight (pending + ongoing + done), not
         # just pending. Otherwise a fast worker / slow trainer pattern keeps
         # pending empty while done_queue grows unbounded.
@@ -225,6 +168,9 @@ class RolloutPromptManager:
         # expected, not a starvation bug. Don't "fix" it by reverting to a
         # pending-only check without addressing the OOM risk.
         in_flight = len(self.pending_queue) + len(self.ongoing_set) + len(self.done_queue)
+        # Wake any worker awaiting pull_prompts. Idempotent — symmetric to
+        # _maybe_signal_batch_ready called from push_prompts.
+        self._prompts_pending.set()
         return in_flight < _PREFETCH_FACTOR * self.batch_size
 
     async def pull_batch(self) -> DataProto:
@@ -273,52 +219,52 @@ class RolloutPromptManager:
             self._batch_ready.clear()
         return result
 
-    def pull_prompts(self, traj_count: int) -> list[RolloutPrompt]:
-        """Hand at most max_count prompts to a worker; moves them pending → ongoing."""
+    async def pull_prompts(self, prompt_count: int) -> list[RolloutPrompt]:
+        """Block until push_batch has added at least one prompt, then move up
+        to `prompt_count` prompts from pending → ongoing.
+
+        Outer `while` handles two workers waking from one `set()`: whoever runs
+        first drains, the loser re-blocks on the next push_batch's set().
+        """
+        while not self.pending_queue:
+            await self._prompts_pending.wait()
+
         for prompt in self.pending_queue:
             assert prompt.prompt_id not in self.ongoing_set, f"prompt {prompt.prompt_id} already in ongoing_set"
 
         pending_prompts = []
-        while traj_count > 0 and self.pending_queue:
-            traj_count -= get_unfinished_traj_count(self.pending_queue[0])
+        while prompt_count > 0 and self.pending_queue:
             pending_prompts.append(self.pending_queue.popleft())
+            prompt_count -= 1
         self.ongoing_set.update(p.prompt_id for p in pending_prompts)
+        # Clear so the next pull blocks until push_batch supplies more.
+        if not self.pending_queue:
+            self._prompts_pending.clear()
         return pending_prompts
 
     def push_prompts(self, prompts: list[RolloutPrompt]) -> None:
-        """Return prompts from a worker; routes done ones to done_queue, aborted ones back to pending."""
+        """Return fully-rolled-out prompts from a worker; ongoing_set → done_queue.
+
+        With `FullyLLMServerClient` absorbing abort/resume inside `client.generate()`,
+        every prompt the worker pushes is terminal (all n rollouts done +
+        postprocessed). No aborted-back-to-pending path.
+        """
         # Validate first, then mutate — same atomicity discipline as push_batch.
-        # Catches both "prompt was never pulled" and "same prompt pushed twice
-        # in this call" before any state changes. is_prompt_done is computed
-        # here too so the mutate phase below is pure dict/deque ops with no
-        # logic that could raise mid-loop.
+        # Catches "prompt was never pulled" and "same prompt pushed twice in
+        # one call" before any state changes.
         seen: set[str] = set()
-        done_flags: list[bool] = []
         for prompt in prompts:
             assert prompt.prompt_id in self.ongoing_set, (
                 f"push_prompts: {prompt.prompt_id!r} was never pulled (not in ongoing_set)"
             )
             assert prompt.prompt_id not in seen, f"push_prompts: {prompt.prompt_id!r} appears twice in the same call"
             seen.add(prompt.prompt_id)
-            done_flags.append(is_prompt_done(prompt))
 
-        # appendleft (LIFO): an aborted prompt goes to the head so the next
-        # pull_prompts resumes it while its KV cache may still be live on the
-        # rollout server. Don't change to append() without benchmarking — the
-        # LIFO bias is a deliberate cache-locality optimization, not a fairness
-        # bug.
-        #
-        # Multiple aborted prompts in one push are all cancelled at the same
-        # rollout-cancel barrier, so their relative order isn't meaningful —
-        # we don't bother preserving it.
-        for prompt, is_done in zip(prompts, done_flags, strict=True):
+        for prompt in prompts:
             # remove (not discard): assert above guarantees membership, so a
             # KeyError here would mean an internal bug we want to surface.
             self.ongoing_set.remove(prompt.prompt_id)
-            if is_done:
-                self.done_queue.append(prompt)
-            else:
-                self.pending_queue.appendleft(prompt)
+            self.done_queue.append(prompt)
         # Wake any pull_batch waiter if this push pushed done_queue over the
         # threshold. Hot path for throughput — without this, pull_batch would
         # block on _batch_ready forever even after the batch is ready.

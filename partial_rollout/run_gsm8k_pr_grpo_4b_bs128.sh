@@ -31,6 +31,7 @@ if [ "$rollout_mode" = "async" ]; then
 fi
 
 python3 -m recipe.partial_rollout.main_ppo \
+    +async_training.partial_rollout=True \
     algorithm.adv_estimator=grpo \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.rollout_correction.rollout_is_threshold=2.0 \
@@ -58,7 +59,7 @@ python3 -m recipe.partial_rollout.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name="${rollout_name}" \
     actor_rollout_ref.rollout.mode="${rollout_mode}" \
-    actor_rollout_ref.rollout.agent.default_agent_loop=prv3_single_turn_agent \
+    actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \

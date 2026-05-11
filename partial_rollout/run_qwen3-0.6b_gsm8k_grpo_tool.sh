@@ -9,7 +9,7 @@ export HTTPS_PROXY=
 
 # Tool-calling variant of run_qwen3-0.6b_gsm8k_grpo.sh.
 # Differences vs. the single-turn script:
-#   - default_agent_loop=prv3_tool_agent (multi-turn agent loop with tool calls)
+#   - default_agent_loop=tool_agent (multi-turn agent loop with tool calls)
 #   - rollout.multi_turn.{enable,tool_config_path,max_assistant_turns} set
 #   - data.return_raw_chat=True so messages list survives to the agent loop
 #   - max_prompt_length / max_response_length doubled to give room for
@@ -47,6 +47,7 @@ python3 -m recipe.partial_rollout.main_ppo \
     data.max_prompt_length=1024 \
     data.max_response_length=3584 \
     data.return_raw_chat=True \
+    +async_training.partial_rollout=True \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=False \
     algorithm.rollout_correction.rollout_is=token \
@@ -77,7 +78,7 @@ python3 -m recipe.partial_rollout.main_ppo \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.top_k=-1 \
-    actor_rollout_ref.rollout.agent.default_agent_loop=prv3_tool_agent \
+    actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=5 \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$TOOL_CONFIG_PATH" \

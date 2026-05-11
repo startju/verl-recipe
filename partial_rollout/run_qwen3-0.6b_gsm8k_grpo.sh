@@ -28,6 +28,7 @@ python3 -m recipe.partial_rollout.main_ppo \
     data.train_batch_size=8 \
     data.max_prompt_length=512 \
     data.max_response_length=4096 \
+    +async_training.partial_rollout=True \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=False \
     algorithm.rollout_correction.rollout_is=token \
@@ -58,7 +59,7 @@ python3 -m recipe.partial_rollout.main_ppo \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.top_k=-1 \
-    actor_rollout_ref.rollout.agent.default_agent_loop=prv3_single_turn_agent \
+    actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.max_model_len=4608 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \

@@ -14,37 +14,17 @@
 
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Optional
 from uuid import uuid4
 
-import hydra
-import numpy as np
 import ray
 
-# Import for side-effect: PRv3{SingleTurn,Tool}AgentLoop's @register(...) decorators
-# only fire when these modules are imported. Workers load agent_loop.py to construct
-# PRv3AgentLoopWorker; piggy-backing on that import path ensures the agent loop names
-# are in `_agent_loop_registry` before any worker's run_generate_sequences runs.
-import recipe.partial_rollout.agent_loop.single_turn_agent_loop  # noqa: F401
-import recipe.partial_rollout.agent_loop.tool_agent_loop  # noqa: F401
 from omegaconf import DictConfig
-from recipe.partial_rollout.prompt_manager import (
-    RolloutPrompt,
-    get_unfinished_traj_count,
-    is_prompt_done,
-)
+from recipe.partial_rollout.prompt_manager import RolloutPrompt
 
-from verl.experimental.agent_loop.agent_loop import (
-    AgentLoopManager,
-    AgentLoopOutput,
-    AgentLoopWorker,
-    DictConfigWrap,
-    _agent_loop_registry,
-    get_trajectory_info,
-)
+from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AgentLoopWorker
 from verl.protocol import DataProto
 from verl.utils.ray_utils import auto_await
-from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr
 from verl.workers.rollout.llm_server import LLMServerClient
 
 logger = logging.getLogger(__file__)
@@ -53,6 +33,15 @@ logger.setLevel("INFO")
 
 @ray.remote
 class PRv3AgentLoopWorker(AgentLoopWorker):
+    """Continuous-loop worker. Delegates per-prompt rollout to upstream's
+    `AgentLoopWorker.generate_sequences` (fires the n trajectories, runs
+    `_run_agent_loop`, postprocesses, returns a DataProto). The PRv3
+    additions are just the prompt-manager-driven pull/gen/push loop — no
+    per-prompt dispatch logic, no per-call global_steps tracking (it flows
+    through `gen_batch.meta_info` and `FullyLLMServerClient` records the
+    actual weight versions used).
+    """
+
     def __init__(
         self,
         config: DictConfig,
@@ -63,219 +52,38 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
     ):
         super().__init__(config, llm_client, teacher_client, reward_loop_worker_handles)
         self.prompt_manager_handle = prompt_manager_handle
-        # Cache rollout.n locally so run_generate_sequences can size pull_prompts
-        # by trajectory budget (max_inflight_prompts is in prompt units; pull_prompts
-        # now takes a sub-prompt/traj count).
-        self.n = config.actor_rollout_ref.rollout.n
 
-    async def _run_agent_loop(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
-        # Inject validate flag from per-sample trajectory dict so PRv3 agent
-        # loop subclasses can detect the validate path directly via kwargs
-        # rather than inferring it from sampling_params overrides.
-        # Key name avoids "validate" to prevent collision with upstream
-        # AgentLoopWorker._agent_loop_postprocess(self, output, validate, **kwargs),
-        # which takes `validate` as a positional and would TypeError on a duplicate
-        # via **kwargs.
-        kwargs["_prv3_is_validate"] = trajectory["validate"]
-        return await super()._run_agent_loop(sampling_params, trajectory, agent_name=agent_name, trace=trace, **kwargs)
-
-    async def run_generate_sequences(self, max_inflight_prompts: int, global_steps: int):
-        rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(
-            max_inflight_prompts * self.n
-        )
-
-        # Map task -> unfinished traj count consumed when this rp was pulled.
-        # Refilling the pull budget after a prompt completes uses the *recorded*
-        # count, not n: a partial prompt only consumed (and frees) its remaining
-        # aborted-traj count, not the full n.
-        running_tasks: dict[asyncio.Task, int] = {
-            asyncio.create_task(self._generate_sequences_for_prompt(rp, global_steps)): get_unfinished_traj_count(rp)
-            for rp in rollout_prompts
-        }
-
-        is_canceled = False
-        while running_tasks:
-            done, _ = await asyncio.wait(running_tasks, return_when=asyncio.FIRST_COMPLETED)
-            # Batch all completed prompts into a single push_prompts.remote() call
-            # to amortize Ray actor RPC overhead. push_prompts already accepts
-            # mixed done/aborted lists (prompt_manager.py:285-321).
-            prompts_to_push: list[RolloutPrompt] = []
-            freed_traj = 0
-            for task in done:
-                consumed_traj = running_tasks.pop(task)
-                rollout_prompt = task.result()
-                prompts_to_push.append(rollout_prompt)
-                if not is_prompt_done(rollout_prompt):
-                    is_canceled = True
-                else:
-                    freed_traj += consumed_traj
-            if prompts_to_push:
-                self.prompt_manager_handle.push_prompts.remote(prompts_to_push)
-            if is_canceled:
-                continue
-            new_rollout_prompts: list[RolloutPrompt] = await self.prompt_manager_handle.pull_prompts.remote(freed_traj)
-            for rp in new_rollout_prompts:
-                task = asyncio.create_task(self._generate_sequences_for_prompt(rp, global_steps))
-                running_tasks[task] = get_unfinished_traj_count(rp)
-
-    # copy from AgentLoopWorker generate_sequences
-    async def _generate_sequences_for_prompt(self, rollout_prompt: RolloutPrompt, global_steps: int) -> RolloutPrompt:
-        """Generate sequences from agent loop.
-
-        Args:
-            batch (DataProto): Input batch.
-
-        Returns:
-            DataProto: Output batch.
-            - prompts: [bsz, prompt_length], prompt token ids from dataset.
-            - responses: [bsz, response_length], output token ids include response tokens
-              from LLM generation and observation tokens from tool_calls.
-            - response_mask: [bsz, response_length], 1 for LLM generated tokens, 0 for observation/padding tokens.
-            - input_ids: [bsz, prompt_length + response_length], whole sequence token ids, including prompt tokens
-              and response tokens.
-            - attention_mask: [bsz, prompt_length + response_length], 0 for padding tokens, 1 for other tokens.
-            - position_ids: [bsz, prompt_length + response_length], incremental position ids.
-
-            For multi-turn conversations:
-            responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
-            response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
+    async def run_continuous(self, max_inflight_prompts: int) -> None:
+        """Persistent worker loop fed by the prompt manager's blocking
+        `pull_prompts` (await on an asyncio.Event — no sleep/poll). The
+        abort/resume cycle around `update_weights` is owned by the upstream
+        `checkpoint_engine` (bracketing the weight transfer), and any
+        aborted `client.generate(...)` calls are retried with accumulated
+        context inside `FullyLLMServerClient.generate()`. Loop ends when the
+        actor is destroyed at training end.
         """
-        batch = rollout_prompt.gen_batch_output
-        agent_loop_output_list = rollout_prompt.agent_loop_output_list
-        config = self.rollout_config
-        sampling_params = dict(
-            temperature=config.temperature,
-            top_p=config.top_p,
-            top_k=config.top_k,
-            repetition_penalty=1.0,
-            logprobs=config.calculate_log_probs,
-        )
+        running: set[asyncio.Task] = set()
+        pull = self.prompt_manager_handle.pull_prompts.remote
+        push = self.prompt_manager_handle.push_prompts.remote
 
-        # override sampling params for validation
-        if batch.meta_info.get("validate", False):
-            sampling_params["top_p"] = config.val_kwargs.top_p
-            sampling_params["top_k"] = config.val_kwargs.top_k
-            sampling_params["temperature"] = config.val_kwargs.temperature
+        # Bootstrap: blocks until the trainer's first push_batch.
+        for rp in await pull(max_inflight_prompts):
+            running.add(asyncio.create_task(self._run_one(rp)))
 
-        # by default, we assume it's a single turn agent
-        if "agent_name" not in batch.non_tensor_batch:
-            default_agent_loop = config.agent.default_agent_loop
-            batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
+        while True:
+            done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+            push_list: list[RolloutPrompt] = [t.result() for t in done]
+            running -= done
+            # Fire-and-forget; amortizes the RPC round-trip into the next pull.
+            push(push_list)
+            # Refill by exactly the count we just freed. Blocks if pending is
+            # empty; resumes when push_batch sets _prompts_pending.
+            for rp in await pull(len(push_list)):
+                running.add(asyncio.create_task(self._run_one(rp)))
 
-        if "index" in batch.non_tensor_batch:
-            index = batch.non_tensor_batch["index"]
-        else:
-            index = np.arange(len(batch))
-
-        max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
-
-        # For n rollouts per sample, we trace all n rollouts for selected samples
-        # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-        if max_samples_per_worker is not None:
-            unique_sample_indices = np.unique(index)
-            if max_samples_per_worker < len(unique_sample_indices):
-                selected_samples = set(
-                    np.random.choice(unique_sample_indices, max_samples_per_worker, replace=False).tolist()
-                )
-                traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
-            else:
-                traced_indices = set(range(len(batch)))
-        else:
-            traced_indices = set(range(len(batch)))
-
-        trajectory_info = await get_trajectory_info(
-            batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
-        )
-
-        tasks = []
-        # Track the weight-version range used to generate each sample across the
-        # potentially many aborted-and-resumed worker rounds this prompt goes through.
-        # min defaults to the current global_steps so a fresh sample records "started here";
-        # on resume it carries over the earliest round's value from prior extra_fields.
-        # max stays None until a round finishes non-aborted — aborted rounds intentionally
-        # leave max unset so a later resume round can fill it in.
-        min_global_steps: list[int] = [global_steps] * len(batch)
-        max_global_steps: list[Optional[int]] = [None] * len(batch)
-        for i in range(len(batch)):
-            trace_this_sample = i in traced_indices
-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-            if "min_global_steps" in agent_loop_output_list[i].extra_fields:
-                min_global_steps[i] = agent_loop_output_list[i].extra_fields["min_global_steps"]
-            if "max_global_steps" in agent_loop_output_list[i].extra_fields:
-                max_global_steps[i] = agent_loop_output_list[i].extra_fields["max_global_steps"]
-            kwargs["last_agent_loop_output"] = agent_loop_output_list[i]
-            tasks.append(
-                asyncio.create_task(
-                    self._run_agent_loop_no_post(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
-                )
-            )
-        rollout_prompt.agent_loop_output_list = await asyncio.gather(*tasks)
-        for i in range(len(batch)):
-            rollout_prompt.agent_loop_output_list[i].extra_fields["min_global_steps"] = min_global_steps[i]
-            if max_global_steps[i] is not None:
-                rollout_prompt.agent_loop_output_list[i].extra_fields["max_global_steps"] = max_global_steps[i]
-            elif rollout_prompt.agent_loop_output_list[i].extra_fields["stop_reason"] != "aborted":
-                rollout_prompt.agent_loop_output_list[i].extra_fields["max_global_steps"] = global_steps
-
-        if is_prompt_done(rollout_prompt):
-            coros = []
-            for i in range(len(batch)):
-                kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-                coros.append(
-                    self._agent_loop_postprocess(
-                        rollout_prompt.agent_loop_output_list[i], trajectory_info[i]["validate"], **kwargs
-                    )
-                )
-            internal_agent_loop_output_list = await asyncio.gather(*coros)
-            rollout_prompt.gen_batch_output = self._postprocess(
-                internal_agent_loop_output_list,
-                input_non_tensor_batch=batch.non_tensor_batch,
-                validate=batch.meta_info.get("validate", False),
-            )
-            rollout_prompt.agent_loop_output_list = []
-        return rollout_prompt
-
-    # copy from AgentLoopWorker._run_agent_loop without call _agent_loop_postprocess
-    async def _run_agent_loop_no_post(
-        self,
-        sampling_params: dict[str, Any],
-        trajectory: dict[str, Any],
-        *,
-        agent_name: str,
-        trace: bool = True,
-        **kwargs,
-    ) -> AgentLoopOutput:
-        with rollout_trace_attr(
-            step=trajectory["step"],
-            sample_index=trajectory["sample_index"],
-            rollout_n=trajectory["rollout_n"],
-            validate=trajectory["validate"],
-            name="agent_loop",
-            trace=trace,
-        ):
-            assert agent_name in _agent_loop_registry, (
-                f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
-            )
-            assert agent_name.startswith("prv3_"), (
-                f"partial rollout requires a PRv3-aware agent loop (consumes `last_agent_loop_output` to resume "
-                f"after abort), got {agent_name!r}; otherwise resume silently degrades to full rollout"
-            )
-
-            agent_loop_config = _agent_loop_registry[agent_name]
-            agent_loop = hydra.utils.instantiate(
-                config=agent_loop_config,
-                trainer_config=DictConfigWrap(config=self.config),
-                server_manager=self.llm_client,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-                dataset_cls=self.dataset_cls,
-                data_config=DictConfigWrap(self.config.data),
-            )
-            # Symmetric with PRv3AgentLoopWorker._run_agent_loop: inject the
-            # validate flag so every PRv3 agent_loop.run() call receives the
-            # same kwargs shape regardless of dispatch path (train vs validate).
-            kwargs["_prv3_is_validate"] = trajectory["validate"]
-            return await agent_loop.run(sampling_params, **kwargs)
+    async def _run_one(self, rp: RolloutPrompt) -> RolloutPrompt:
+        rp.gen_batch_output = await super().generate_sequences(rp.gen_batch_output)
+        return rp
 
 
 class PRv3AgentLoopManager(AgentLoopManager):
@@ -285,11 +93,8 @@ class PRv3AgentLoopManager(AgentLoopManager):
       cross-step partial-rollout state lives in a Ray actor instead of being
       threaded through generate_sequences kwargs.
     - Skips automatic worker creation in `create()` because workers need the
-      prompt manager (and the trainer's `PRv3LLMServerManager` for cancel/resume),
-      which the trainer wires in post-init via `init_agent_loop_workers(...)`.
-    - Replaces `cancel`/`resume` so they target replicas owned by the now-decoupled
-      LLMServerManager. Replicas were extracted out of AgentLoopManager when
-      upstream split rollout-server lifecycle off into LLMServerManager.
+      prompt manager, which the trainer wires in post-init via
+      `init_agent_loop_workers(...)`.
     """
 
     def __init__(
@@ -302,9 +107,8 @@ class PRv3AgentLoopManager(AgentLoopManager):
         self.agent_loop_workers_class = PRv3AgentLoopWorker
         super().__init__(config, llm_client, teacher_client, reward_loop_worker_handles)
         # Set by the trainer via init_agent_loop_workers; until then, calling
-        # generate_sequences / cancel / resume is a programming error.
+        # generate_sequences is a programming error.
         self.rollout_prompt_manager: Optional[ray.actor.ActorHandle] = None
-        self.llm_server_manager = None
 
     @classmethod
     @auto_await
@@ -320,10 +124,21 @@ class PRv3AgentLoopManager(AgentLoopManager):
         return cls(*args, **kwargs)
 
     @auto_await
-    async def init_agent_loop_workers(self, rollout_prompt_manager, llm_server_manager):
+    async def init_agent_loop_workers(self, rollout_prompt_manager):
         self.rollout_prompt_manager = rollout_prompt_manager
-        self.llm_server_manager = llm_server_manager
         await self._init_agent_loop_workers()
+        # Spawn each worker's persistent loop fire-and-forget. Workers immediately
+        # start polling `prompt_manager.pull_prompts` (which blocks on an
+        # asyncio.Event until the trainer's first push_batch). Abort cycles
+        # around `update_weights` are absorbed by upstream's checkpoint_engine
+        # + `FullyLLMServerClient.generate()` retry — workers don't need to
+        # know about them.
+        train_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        num_workers = len(self.agent_loop_workers)
+        max_inflight_prompts = (train_batch_size + num_workers - 1) // num_workers
+        self._worker_loop_refs = [
+            worker.run_continuous.remote(max_inflight_prompts) for worker in self.agent_loop_workers
+        ]
 
     async def _init_agent_loop_workers(self):
         # Mirrors upstream `AgentLoopManager._init_agent_loop_workers` (verl
@@ -353,51 +168,22 @@ class PRv3AgentLoopManager(AgentLoopManager):
 
     @auto_await
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """Split input batch and dispatch to agent loop workers.
+        """Block until the prompt manager has a full training batch ready.
 
-        Args:
-            prompts (DataProto): Input batch.
-
-        Returns:
-            DataProto: Output batch.
+        Workers run a persistent loop (`PRv3AgentLoopWorker.run_continuous`)
+        spawned in `init_agent_loop_workers`. Per-sample weight-version
+        tracking lives in `gen_batch.meta_info` (set by the trainer) and
+        `FullyLLMServerClient.generate()`'s retry loop; no per-worker
+        fan-out needed.
         """
-        await self.resume()
         if prompts.meta_info.get("validate", False):
+            # Validation uses the upstream `generate_sequences` path which
+            # spawns its own per-call rollouts via the llm_client; the
+            # continuous workers are unaffected and stay blocked in
+            # `pull_prompts` until the next training-side `push_batch`.
             return await super().generate_sequences(prompts)
 
-        assert "global_steps" in prompts.meta_info, (
-            "PRv3 generate_sequences requires meta_info['global_steps'] to track per-sample weight-version range"
-        )
-        global_steps = prompts.meta_info["global_steps"]
-
-        # prompts.batch is None: upstream `_get_gen_batch` doesn't pop tensor keys
-        # (agent-loop only consumes non_tensor_batch), so derive row count from uid,
-        # which repeat() carries through verbatim. After repeat-by-n, the uid array
-        # has len = n * num_rollout_prompts.
-        num_rollout_prompts = len(prompts.non_tensor_batch["uid"]) // self.config.actor_rollout_ref.rollout.n
-
-        max_inflight_prompts = (num_rollout_prompts + len(self.agent_loop_workers) - 1) // len(self.agent_loop_workers)
-        worker_tasks = [
-            worker.run_generate_sequences.remote(max_inflight_prompts, global_steps)
-            for worker in self.agent_loop_workers
-        ]
-
-        # pull_batch is now async server-side and blocks on an internal
+        # pull_batch is async server-side and blocks on an internal
         # asyncio.Event until done_queue >= batch_size. One round-trip, no
         # manager-side polling, no per-step ~10k empty Ray RPCs.
-        output = await self.rollout_prompt_manager.pull_batch.remote()
-        await self.cancel()
-        await asyncio.gather(*worker_tasks)
-
-        # calculate performance metrics
-        # outputs = [output]
-        # metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
-        # timing = self._performance_metrics(metrics, output)
-        # output.meta_info = {"timing": timing, **outputs[0].meta_info}
-        return output
-
-    async def cancel(self):
-        await self.llm_server_manager.cancel()
-
-    async def resume(self):
-        await self.llm_server_manager.resume()
+        return await self.rollout_prompt_manager.pull_batch.remote()

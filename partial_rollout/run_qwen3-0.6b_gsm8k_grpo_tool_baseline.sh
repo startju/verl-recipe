@@ -5,7 +5,7 @@ set -xeo pipefail
 # GRPO with tool-call agent loop, NO partial rollout. Differences vs. the PR
 # variant of the tool script:
 #   - python -m verl.trainer.main_ppo (upstream entry, not PRv3)
-#   - default_agent_loop=tool_agent (upstream loop, not prv3_tool_agent)
+#   - default_agent_loop=tool_agent 
 #   - same algorithm.rollout_correction.rollout_is settings as the PR variant
 #     (baseline is on-policy → ratios ~1, but keeps the loss code path identical)
 # Same multi-turn / tool config as the PR variant so A/B is apples-to-apples.
