@@ -99,8 +99,8 @@ class RolloutPromptManager:
         # CPU and there are no per-empty-pull Ray RPCs.
         self._prompts_pending: asyncio.Event = asyncio.Event()
         # Latched by stop(); workers await it via `wait_until_stop` and treat
-        # the wake-up as their shutdown signal. asyncio.Event (not a bool)
-        # because `wait_until_stop` needs to block until it fires.
+        # the wake-up as their shutdown signal. `pull_prompts` checks
+        # `is_set()` for a cheap sync short-circuit.
         self._stop_event: asyncio.Event = asyncio.Event()
 
     def _maybe_signal_batch_ready(self) -> None:
