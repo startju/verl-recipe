@@ -1,0 +1,18 @@
+# partial_rollout — rolling against upstream main; recipe folder lives on a fork branch
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=rolling
+BRANCH=main
+# Exact upstream verl commit this file was refreshed against (core library).
+VERL_COMMIT=8ebccd4468ab5f947e90e712f36a0d7ddbb775a9
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@8ebccd4468ab5f947e90e712f36a0d7ddbb775a9
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout 8ebccd4468ab5f947e90e712f36a0d7ddbb775a9 && git submodule update --init --recursive recipe && (cd recipe && git fetch https://github.com/startju/verl-recipe.git partial_rollout-simplify && git checkout 3665b44dac78ae993d8daad989a67e4272a02d7c)
+# Upstream verl-recipe does not host partial_rollout/; checkout the fork branch below to land the folder.
+RECIPE_FORK=https://github.com/startju/verl-recipe.git
+RECIPE_FORK_BRANCH=partial_rollout-simplify
+# Recipe-side commit pinning the partial_rollout/ tree this file was refreshed against.
+RECIPE_SUBMODULE_COMMIT=3665b44dac78ae993d8daad989a67e4272a02d7c
+RECIPE_FOLDER=partial_rollout
+# Latest commit in the recipe repo that touched only this recipe subdirectory.
+RECIPE_FOLDER_LAST_COMMIT=3665b44dac78ae993d8daad989a67e4272a02d7c
+NOTES=VERL_COMMIT pins the core library; RECIPE_SUBMODULE_COMMIT is the `recipe/` submodule gitlink at that verl revision; RECIPE_FOLDER_LAST_COMMIT narrows to this folder inside the submodule.
+REFRESH=Recompute: (cd verl && git rev-parse HEAD); (cd verl/recipe && git rev-parse HEAD); (cd verl/recipe && git log -1 --format=%H -- partial_rollout)
