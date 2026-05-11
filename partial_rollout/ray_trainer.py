@@ -255,7 +255,6 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
             pprint(f"Initial validation metrics: {val_metrics}")
             self.logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
-                self.async_rollout_manager.shutdown()
                 return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
@@ -272,7 +271,6 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
             # configured limit; nothing left to do. Without this guard the loop
             # below would unconditionally run one more step before checking
             # is_last_step.
-            self.async_rollout_manager.shutdown()
             return
         self.last_val_metrics = None
         self.max_steps_duration = 0
@@ -301,7 +299,6 @@ class PRv3RayPPOTrainer(SeparateRayPPOTrainer):
                 is_last_step = self.is_last_step
                 self.fit_step(data_loader_iter)
                 if is_last_step:
-                    self.async_rollout_manager.shutdown()
                     return
 
     def fit_step(self, data_loader_iter):

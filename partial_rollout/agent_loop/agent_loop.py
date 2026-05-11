@@ -59,29 +59,17 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         Aborted `client.generate(...)` calls are retried with accumulated
         context inside `FullyLLMServerClient.generate()`, so the worker is
         oblivious to the cancel/resume cycle the manager wires around
-        `update_weights`.
-
-        Exit: a separate `stop_task` awaits `RolloutPromptManager
-        .wait_until_stop` on its own RPC channel. When it fires, we cancel
-        every in-flight rollout (most likely blocked inside
-        `FullyLLMServerClient.generate()`'s retry-on-abort loop, waiting for
-        a next-step `resume()` that won't come at training end). The
-        `CancelledError` unblocks the retry loop; tasks finish; loop exits.
+        `update_weights`. The loop runs for the actor's lifetime; Ray actor
+        destruction at training end terminates it.
         """
-        # `running` holds every task we await: rollouts, at most one pull
-        # task, and the shutdown-signal `stop_task`. Capacity calc subtracts
-        # `pull_task` and `stop_task` so only rollouts count against
-        # `max_inflight_prompts`.
         pull = self.prompt_manager_handle.pull_prompts.remote
         push = self.prompt_manager_handle.push_prompts.remote
-        stop_task: asyncio.Task = asyncio.ensure_future(self.prompt_manager_handle.wait_until_stop.remote())
-        running: set[asyncio.Task] = {stop_task}
+        running: set[asyncio.Task] = set()
         pull_task: Optional[asyncio.Task] = None
-        stopping = False
 
-        while running:
-            rollouts = len(running) - (stop_task in running) - (pull_task in running)
-            if not stopping and pull_task is None and rollouts < max_inflight_prompts:
+        while True:
+            rollouts = len(running) - (pull_task in running)
+            if pull_task is None and rollouts < max_inflight_prompts:
                 pull_task = asyncio.ensure_future(pull(max_inflight_prompts - rollouts))
                 running.add(pull_task)
 
@@ -90,24 +78,14 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
 
             push_list: list[RolloutPrompt] = []
             for t in done:
-                if t is stop_task:
-                    stopping = True
-                elif t is pull_task:
+                if t is pull_task:
                     pull_task = None
-                    rps = t.result()
-                    if not rps:
-                        stopping = True
-                    elif not stopping:
-                        running.update(asyncio.create_task(self._run_one(p)) for p in rps)
-                elif not t.cancelled():
+                    running.update(asyncio.create_task(self._run_one(p)) for p in t.result())
+                else:
                     push_list.append(t.result())
 
-            if stopping:
-                # task.cancel() is idempotent on already-cancelled tasks, so
-                # firing every iter while stopping is fine.
-                for task in running - {pull_task, stop_task}:
-                    task.cancel()
             if push_list:
+                # Fire-and-forget; doesn't block the next pull.
                 push(push_list)
 
     async def _run_one(self, rp: RolloutPrompt) -> RolloutPrompt:
@@ -145,9 +123,6 @@ class PRv3AgentLoopManager(AgentLoopManager):
         # generate_sequences / cancel / resume is a programming error.
         self.rollout_prompt_manager: Optional[ray.actor.ActorHandle] = None
         self.llm_server_manager: Optional[LLMServerManager] = None
-        # ObjectRefs for each worker's run_continuous loop. Populated by
-        # init_agent_loop_workers, awaited (gathered) by shutdown.
-        self._worker_loop_refs: list[ray.ObjectRef] = []
 
     @classmethod
     @auto_await
@@ -180,9 +155,9 @@ class PRv3AgentLoopManager(AgentLoopManager):
         train_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
         num_workers = len(self.agent_loop_workers)
         max_inflight_prompts = (train_batch_size + num_workers - 1) // num_workers
-        self._worker_loop_refs = [
-            worker.run_continuous.remote(max_inflight_prompts) for worker in self.agent_loop_workers
-        ]
+        # Fire-and-forget — workers run until Ray terminates them at training end.
+        for worker in self.agent_loop_workers:
+            worker.run_continuous.remote(max_inflight_prompts)
 
     async def _init_agent_loop_workers(self):
         # Mirrors upstream `AgentLoopManager._init_agent_loop_workers` (verl
@@ -257,25 +232,3 @@ class PRv3AgentLoopManager(AgentLoopManager):
 
     async def resume(self):
         await self.llm_server_manager.resume()
-
-    @auto_await
-    async def shutdown(self) -> None:
-        """Stop workers' continuous loops and join their `run_continuous` refs.
-
-        Flow: `stop()` sets `_stop_event` on the prompt manager; each worker's
-        `stop_task` (awaiting `wait_until_stop`) fires; the worker cancels its
-        in-flight rollouts (most likely blocked inside `FullyLLMServerClient
-        .generate()`'s retry-on-abort loop waiting for a next-step `resume()`
-        that won't come); `CancelledError` unblocks the retry loop;
-        `run_continuous` returns. We `asyncio.gather` the stored ObjectRefs
-        so the trainer can synchronize on full shutdown before destroying the
-        actors. Idempotent — second call is a no-op once refs are cleared.
-
-        `return_exceptions=True`: one worker failing shouldn't strand the
-        others mid-shutdown; the shutdown is best-effort by design.
-        """
-        if not self._worker_loop_refs:
-            return
-        await self.rollout_prompt_manager.stop.remote()
-        await asyncio.gather(*self._worker_loop_refs, return_exceptions=True)
-        self._worker_loop_refs = []

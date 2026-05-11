@@ -71,7 +71,7 @@
 4. **持续 worker 循环**：每个 `PRv3AgentLoopWorker` 跑 `run_continuous` 直到 actor 销毁；把一个 pull RPC 当 `asyncio.Task` 跟最多 `max_inflight_prompts` 个 rollout 任务一起塞进同一个 `asyncio.wait`。完成的 rollout 不用等 pull 返回就能 push 回去。
 5. **dummy gen_batch 也要带 uid**：epoch 末 dataloader 耗尽时构造的占位 batch 必须填 `non_tensor_batch["uid"]`，否则 manager 端取不到行数。
 6. **stateful dataloader 续训**：`PRv3RayPPOTrainer.fit()` 走 stateful loader 自动恢复进度，**不要**手工加 skip-on-resume 逻辑。
-7. **优雅退出**：`RolloutPromptManager.stop()` 设置 `_stop_event`。每个 worker 的 `run_continuous` 持有一个 `stop_task` —— 通过独立 RPC channel 等 `wait_until_stop.remote()`。`stop_task` 触发后，worker 把还在跑的 rollout 全部 `task.cancel()` 然后返回。cancel 是必需的：最后一个 step 的 `cancel()` 把 vLLM 留在 paused 状态，rollout 卡在 `FullyLLMServerClient` retry 循环里等不到下一个 `resume()`，靠 `CancelledError` 才能把它们放出来。
+7. **不做 graceful shutdown**：`run_continuous` 跑到 actor 销毁为止；fit() return 后 Ray 进程退出会把 worker 杀掉。退出时还在跑的 rollout 直接丢弃 —— trainer 反正也不会再消费它们，无所谓。
 
 ---
 

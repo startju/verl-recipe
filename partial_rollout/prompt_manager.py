@@ -98,10 +98,6 @@ class RolloutPromptManager:
         # sleep/poll with a one-way notification — idle workers consume zero
         # CPU and there are no per-empty-pull Ray RPCs.
         self._prompts_pending: asyncio.Event = asyncio.Event()
-        # Latched by stop(); workers await it via `wait_until_stop` and treat
-        # the wake-up as their shutdown signal. `pull_prompts` checks
-        # `is_set()` for a cheap sync short-circuit.
-        self._stop_event: asyncio.Event = asyncio.Event()
 
     def _maybe_signal_batch_ready(self) -> None:
         # Single edge for any push that may have grown done_queue to threshold.
@@ -225,19 +221,12 @@ class RolloutPromptManager:
 
     async def pull_prompts(self, prompt_count: int) -> list[RolloutPrompt]:
         """Block until push_batch has added at least one prompt, then move up
-        to `prompt_count` prompts from pending → ongoing. Returns `[]` only
-        as a clean exit when `stop()` has been called while we were blocked
-        — workers receive the actual shutdown signal via `wait_until_stop`,
-        not via this return value.
+        to `prompt_count` prompts from pending → ongoing.
 
         Outer `while` handles two workers waking from one `set()`: whoever runs
         first drains, the loser re-blocks on the next push_batch's set().
         """
-        if self._stop_event.is_set():
-            return []
         while not self.pending_queue:
-            if self._stop_event.is_set():
-                return []
             await self._prompts_pending.wait()
 
         for prompt in self.pending_queue:
@@ -252,24 +241,6 @@ class RolloutPromptManager:
         if not self.pending_queue:
             self._prompts_pending.clear()
         return pending_prompts
-
-    def stop(self) -> None:
-        """Trigger graceful shutdown of all workers. Sets `_stop_event` so
-        any `wait_until_stop` callers wake; also sets `_prompts_pending` so
-        a `pull_prompts` blocked on it wakes and returns `[]` cleanly
-        (otherwise its remote coroutine would leak until actor destruction).
-        Idempotent.
-        """
-        self._stop_event.set()
-        self._prompts_pending.set()
-
-    async def wait_until_stop(self) -> None:
-        """Block until `stop()` has been called. Workers await this as a
-        long-lived RPC and use the wake-up as their shutdown signal — keeps
-        `pull_prompts`'s contract focused on returning prompts rather than
-        doubling as a stop signal.
-        """
-        await self._stop_event.wait()
 
     def push_prompts(self, prompts: list[RolloutPrompt]) -> None:
         """Return fully-rolled-out prompts from a worker; ongoing_set → done_queue.

@@ -46,7 +46,21 @@ class PRv3LLMServerManager(LLMServerManager):
         return super().get_client(fully_async=True)
 
     async def cancel(self):
-        await asyncio.gather(*[replica.abort_all_requests() for replica in self.rollout_replicas])
+        # `reset_prefix_cache=False`: the default True triggers vLLM's
+        # `pause_generation(clear_cache=True)` which clears prefix + MM caches.
+        # When cancel is followed by `sleep_replicas` → train → `update_weights`
+        # → wake_up (as in our cross-step flow), the cleared caches corrupt the
+        # state vLLM's wake_up warmup-forward expects, surfacing as a CUDA
+        # "invalid argument" / EngineDeadError. Keeping the prefix cache is
+        # cheap and avoids the crash. Skip the replica wrapper (which calls
+        # the server with default args) and hit each server directly.
+        await asyncio.gather(
+            *[
+                server.abort_all_requests.remote(reset_prefix_cache=False)
+                for replica in self.rollout_replicas
+                for server in replica.servers
+            ]
+        )
 
     async def resume(self):
         await asyncio.gather(*[replica.resume_generation() for replica in self.rollout_replicas])
