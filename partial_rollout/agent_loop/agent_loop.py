@@ -92,25 +92,22 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
             for t in done:
                 if t is stop_task:
                     stopping = True
-                    for task in running:
-                        if task not in (pull_task, stop_task):
-                            task.cancel()
                 elif t is pull_task:
-                    rps = t.result()
-                    if rps and not stopping:
-                        running.update(asyncio.create_task(self._run_one(p)) for p in rps)
-                    elif not rps:
-                        # Empty pull == manager stopped; mirror stop_task branch.
-                        stopping = True
-                        for task in running:
-                            if task not in (pull_task, stop_task):
-                                task.cancel()
                     pull_task = None
+                    rps = t.result()
+                    if not rps:
+                        stopping = True
+                    elif not stopping:
+                        running.update(asyncio.create_task(self._run_one(p)) for p in rps)
                 elif not t.cancelled():
                     push_list.append(t.result())
 
+            if stopping:
+                # task.cancel() is idempotent on already-cancelled tasks, so
+                # firing every iter while stopping is fine.
+                for task in running - {pull_task, stop_task}:
+                    task.cancel()
             if push_list:
-                # Fire-and-forget; doesn't block the next pull.
                 push(push_list)
 
     async def _run_one(self, rp: RolloutPrompt) -> RolloutPrompt:
