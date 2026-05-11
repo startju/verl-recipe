@@ -93,21 +93,14 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
             for t in done:
                 if t is stop_task:
                     stopping = True
-                    # Cancel rollout tasks only — they may be blocked inside
-                    # `FullyLLMServerClient.generate()`'s retry loop and need
-                    # `CancelledError` to exit. The pull_task (if any) is
-                    # left to return naturally: `stop()` set `_prompts_pending`
-                    # so the manager-side `pull_prompts` wakes, sees
-                    # `_stop_event.is_set()`, and returns [].
+                    # pull_task returns naturally via `_prompts_pending` set
+                    # in stop(); only rollouts need CancelledError.
                     for task in running:
                         if task is not pull_task:
                             task.cancel()
                 elif t is pull_task:
                     pull_task = None
-                    # Don't spawn new rollouts once stopping — they'd just be
-                    # cancelled on the next iter (race when stop_task and
-                    # pull_task land in the same `done` set, processed in
-                    # arbitrary order).
+                    # Skip spawn if stop_task fired this iter (set order race).
                     if not stopping:
                         running.update(asyncio.create_task(self._run_one(p)) for p in t.result())
                 elif not t.cancelled():
