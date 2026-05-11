@@ -71,45 +71,36 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         the rollouts already in flight (pushing each back), and return.
         """
         # `running` holds every asyncio.Task we await — rollout tasks plus at
-        # most one pull task. The pull check below only enters when
-        # `pull_task is None`, so `len(running)` at that point counts rollouts
-        # only and `remaining` stays correct.
-        running: set[asyncio.Task] = set()
+        # most one pull task. The pull-creation branch only enters when
+        # `pull_task is None`, so `len(running)` there counts rollouts only.
         pull = self.prompt_manager_handle.pull_prompts.remote
         push = self.prompt_manager_handle.push_prompts.remote
-
+        running: set[asyncio.Task] = set()
         pull_task: Optional[asyncio.Task] = None
         stopping = False
 
-        while True:
-            # Keep one pull in flight whenever capacity allows. The pull itself
-            # blocks on an asyncio.Event in the manager when `pending_queue` is
-            # empty, so an in-flight pull is free.
-            if not stopping and pull_task is None:
-                remaining = max_inflight_prompts - len(running)
-                if remaining > 0:
-                    pull_task = asyncio.ensure_future(pull(remaining))
-                    running.add(pull_task)
-
-            if not running:
-                # Stopping with nothing left in flight — drained, exit.
-                return
+        while running or not stopping:
+            # Keep one pull in flight whenever capacity allows. The pull
+            # blocks on an asyncio.Event in the manager when `pending_queue`
+            # is empty, so an in-flight pull is free.
+            if not stopping and pull_task is None and len(running) < max_inflight_prompts:
+                pull_task = asyncio.ensure_future(pull(max_inflight_prompts - len(running)))
+                running.add(pull_task)
 
             done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+            running -= done
 
             push_list: list[RolloutPrompt] = []
             for t in done:
-                running.discard(t)
                 if t is pull_task:
+                    pull_task = None
                     rps = t.result()
-                    if not rps:
+                    if rps:
+                        running.update(asyncio.create_task(self._run_one(p)) for p in rps)
+                    else:
                         # Shutdown signal from the manager: stop issuing pulls
                         # and let `running` drain.
                         stopping = True
-                    else:
-                        for rp in rps:
-                            running.add(asyncio.create_task(self._run_one(rp)))
-                    pull_task = None
                 else:
                     push_list.append(t.result())
 
