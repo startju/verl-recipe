@@ -70,6 +70,10 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
         `RolloutPromptManager.stop`). We then stop issuing new pulls, drain
         the rollouts already in flight (pushing each back), and return.
         """
+        # `running` holds every asyncio.Task we await — rollout tasks plus at
+        # most one pull task. The pull check below only enters when
+        # `pull_task is None`, so `len(running)` at that point counts rollouts
+        # only and `remaining` stays correct.
         running: set[asyncio.Task] = set()
         pull = self.prompt_manager_handle.pull_prompts.remote
         push = self.prompt_manager_handle.push_prompts.remote
@@ -85,19 +89,17 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
                 remaining = max_inflight_prompts - len(running)
                 if remaining > 0:
                     pull_task = asyncio.ensure_future(pull(remaining))
+                    running.add(pull_task)
 
-            wait_set: set[asyncio.Task] = set(running)
-            if pull_task is not None:
-                wait_set.add(pull_task)
-
-            if not wait_set:
+            if not running:
                 # Stopping with nothing left in flight — drained, exit.
                 return
 
-            done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
 
             push_list: list[RolloutPrompt] = []
             for t in done:
+                running.discard(t)
                 if t is pull_task:
                     rps = t.result()
                     if not rps:
@@ -109,7 +111,6 @@ class PRv3AgentLoopWorker(AgentLoopWorker):
                             running.add(asyncio.create_task(self._run_one(rp)))
                     pull_task = None
                 else:
-                    running.discard(t)
                     push_list.append(t.result())
 
             if push_list:
